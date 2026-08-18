@@ -10,6 +10,7 @@
 #include <WebServer.h>
 #include <WiFiClientSecure.h>
 
+#include "secrets.h"
 #include "List_SPIFFS.h"
 #include "Web_Fetch.h"
 #include "index.h"
@@ -26,6 +27,13 @@ TFT_eSPI tft = TFT_eSPI();         // Invoke custom library
 int imageOffsetX = 26, imageOffsetY = 20;
 // TFT_eSprite spr = TFT_eSprite(&tft);  // Declare Sprite object "spr" with pointer to "tft" object
 
+
+// Screen layout - computed once in setup() from the actual panel size (not hardcoded)
+// isn't hardcoded to one screen resolution/rotation.
+int albumX, albumY, albumSize;   // album art box 
+int textX, textW;                // artist/song text column,
+int barX, barY, barWidth, barHeight = 10; // progress bar
+
 // // This next function will be called during decoding of the jpeg file to
 // // render each block to the TFT.  If you use a different TFT library
 // // you will need to adapt this function to suit.
@@ -41,16 +49,51 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap)
   return 1;
 }
 
+// Album Art 2-color gradient
+void drawGradientBackground(uint16_t colorTop, uint16_t colorBottom){ 
+    uint8_t r1 = (colorTop >> 11) & 0x1F, g1 = (colorTop >> 5) & 0x3F, b1 = colorTop & 0x1F; 
+    uint8_t r2 = (colorBottom >> 11) & 0x1F, g2 = (colorBottom >> 5) & 0x3F, b2 = colorBottom & 0x1F; 
+    int h = tft.height(); 
+    for (int y = 0; y < h; y++) { 
+        float t = (float)y / (float)(h - 1); 
+        uint8_t r = r1 + (uint8_t)((int)(r2 - r1) * t);
+        uint8_t g = g1 + (uint8_t)((int)(g2 - g1) * t);
+        uint8_t b = b1 + (uint8_t)((int)(b2 - b1) * t); 
+    uint16_t color = (r << 11) | (g << 5) | b;
+        tft.drawFastHLine(0, y, tft.width(), color);
+    }
+} 
+
+// Accumulates pixel color sums instead of drawing to screen - used as a
+// TJpg_Decoder callback to compute the album art's average color, so we can
+// derive the gradient background from it without a full histogram/clustering
+// pass (too heavy for this MCU). Doesn't touch the display.
+
+uint32_t colorSumR = 0, colorSumG = 0, colorSumB = 0, colorSampleCount = 0;
+bool color_sample_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap)		
+{
+    uint32_t n = (uint32_t)w * h;
+    for (uint32_t i = 0; i < n; i++) {
+        uint16_t p = bitmap[i];
+        colorSumR += (p >> 11) & 0x1F; // 5-bit red
+        colorSumG += (p >> 5) & 0x3F;  // 6-bit green
+        colorSumB += p & 0x1F;         // 5-bit blue
+        colorSampleCount++;
+    }
+    return 1; // keep decoding, we just don't draw these blocks
+}
+
+
 /*=========================
 |User modifiable variables|
 =========================*/
-// WiFi credentials
-#define WIFI_SSID ""
-#define PASSWORD ""
+// WiFi credentials MOVED TO SECRET
+//#define WIFI_SSID ""
+//#define PASSWORD ""
 
 // Spotify API credentials
-#define CLIENT_ID ""
-#define CLIENT_SECRET ""
+//#define CLIENT_ID ""
+//#define CLIENT_SECRET ""
 #define REDIRECT_URI "https://spotifyesp32.vercel.app/api/spotify/callback"
 
 // ESP32-CYD pin assignments -----------------------------------------------
@@ -139,7 +182,7 @@ struct songDetails{
 
 char *parts[10];
 
-void printSplitString(String text,int maxLineSize, int yPos)
+void printSplitString(String text,int maxLineSize, int yPos, int columnX, int columnWidth)
 {
     int currentWordStart = 0;
     int spacedCounter = 0;
@@ -190,7 +233,12 @@ void printSplitString(String text,int maxLineSize, int yPos)
         if(output[0] == ' ')
             output = output.substring(1);
         // Serial.println(output);
+        // Center each wrapped line within its column (columnX..columnX+columnWidth)
+        // instead of the whole screen, so text sits in the right-hand column
+        // next to the album art rather than spanning edge-to-edge.
         tft.setCursor((int)(tft.width()/2 - tft.textWidth(output) / 2),tft.getCursorY());
+        tft.setCursor((int)(columnX + columnWidth/2 - tft.textWidth(output) / 2),tft.getCursorY());
+        tft.println(output);
         tft.println(output);
         // free(printable);
     }
@@ -325,7 +373,7 @@ public:
                 Serial.println("Image load was: ");
                 Serial.println(loaded_ok);
                 refresh = true;
-                tft.fillScreen(TFT_BLACK);
+                //tft.fillScreen(TFT_BLACK); moved to gradient repaint
             }
             currentSong.album = albumName.substring(1,albumName.length()-1);
             currentSong.artist = artistName.substring(1,artistName.length()-1);
@@ -411,65 +459,96 @@ public:
         return success;
     }
     bool drawScreen(bool fullRefresh = false, bool likeRefresh = false){
-        int rectWidth = 120;
-        int rectHeight = 10;
+       // int rectWidth = 120;
+        //int rectHeight = 10;
         if(fullRefresh){
+            // Sample the album art's average color (or fall back to a neutral
+            // dark tone if there's no art yet) and paintthe bg with
+            // a two-color gradient derived from it, before drawing anything
+            // else on top. 
+            uint16_t avgR = 20, avgG = 20, avgB = 20; // fallback: neutral dark gray
+            if (SPIFFS.exists("/albumArt.jpg") == true) {
+                colorSumR = colorSumG = colorSumB = 0;
+                colorSampleCount = 0;
+                TJpgDec.setSwapBytes(true);
+                TJpgDec.setJpgScale(8); // small/fast decode, we only need an average
+                TJpgDec.setCallback(color_sample_output);
+                TJpgDec.drawFsJpg(0, 0, "/albumArt.jpg");
+                TJpgDec.setCallback(tft_output); // restore normal drawing callback
+                if (colorSampleCount > 0) {
+                    avgR = (colorSumR / colorSampleCount) << 3; // 5-bit -> 8-bit
+                    avgG = (colorSumG / colorSampleCount) << 2; // 6-bit -> 8-bit
+                    avgB = (colorSumB / colorSampleCount) << 3; // 5-bit -> 8-bit
+                }
+            }
+            auto clampByte = [](int v){ return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)); };
+            uint8_t topR = clampByte(avgR + 35), topG = clampByte(avgG + 35), topB = clampByte(avgB + 35);
+            uint8_t botR = clampByte(avgR - 35), botG = clampByte(avgG - 35), botB = clampByte(avgB - 35);
+            bgColorTop    = ((topR & 0xF8) << 8) | ((topG & 0xFC) << 3) | (topB >> 3);
+            bgColorBottom = ((botR & 0xF8) << 8) | ((botG & 0xFC) << 3) | (botB >> 3);
+            drawGradientBackground(bgColorTop, bgColorBottom); 
+
             if (SPIFFS.exists("/albumArt.jpg") == true) { 
                 TJpgDec.setSwapBytes(true);
-                TJpgDec.setJpgScale(4);
-                TJpgDec.drawFsJpg(26, 5, "/albumArt.jpg");
+                TJpgDec.setJpgScale(2);
+                TJpgDec.drawFsJpg(albumX, albumY, "/albumArt.jpg");
             }else{
                 TJpgDec.setSwapBytes(false);
                 TJpgDec.setJpgScale(1);
-                TJpgDec.drawFsJpg(0, 0, "/Angry.jpg");
+                TJpgDec.drawFsJpg(albumX, albumY, "/Angry.jpg");
             }
             tft.setTextDatum(MC_DATUM);
             tft.setTextWrap(true);
-            tft.setCursor(0,85);
-            printSplitString(currentSong.artist,20,85);
-            // tft.drawString(currentSong.artist, tft.width() / 2, 10);
-            tft.setCursor(0,110);
+            tft.setTextColor(TFT_WHITE);
+            tft.setCursor(textX,albumY + 15);
+            printSplitString(currentSong.artist,14,albumY + 15,textX,textW);
 
-            printSplitString(currentSong.song,20,110);
+            
+            tft.setCursor(textX,albumY + 55);
+            printSplitString(currentSong.song,14,albumY + 55,textX,textW); 
             // tft.print(currentSong.song);
             // tft.drawString(currentSong.song, tft.width() / 2, 115);
             // tft.drawString(currentSong.song, tft.width() / 2, 125);
             
             tft.drawRoundRect(
-                tft.width() / 2 - rectWidth / 2,
-                140,
-                rectWidth,
-                rectHeight,
+                barX,
+                barY,
+                barWidth,
+                barHeight,
                 4,
                 TFT_DARKGREEN);
         }
         if(fullRefresh || likeRefresh){
             if(currentSong.isLiked){
+                TJpgDec.setSwapBytes(true);
                 TJpgDec.setJpgScale(1);
-                TJpgDec.drawFsJpg(128-20, 0, "/heart.jpg");
+                TJpgDec.drawFsJpg(tft.width()-21, 0, "/heart.jpg");
             //    tft.fillCircle(128-10,10,10,TFT_GREEN);
             }else{
-                tft.fillRect(128-21,0,21,21,TFT_BLACK);
+                // Clear with the background's top gradient color instead of a
+                // flat black square, so it blends in now that the background
+                // isn't solid black anymore. 
+                tft.fillRect(tft.width()-21,0,21,21,bgColorTop);
             }
         }
         if(lastSongPositionMs > currentSongPositionMs){
             tft.fillSmoothRoundRect(
-                tft.width() / 2 - rectWidth / 2 + 2,
-                140 + 2,
-                rectWidth  - 4,
-                rectHeight - 4,
+                barX + 2,
+                barY + 2,
+                barWidth - 4,
+                barHeight - 4,
                 10,
-                TFT_BLACK
+                bgColorBottom
             );
             lastSongPositionMs = currentSongPositionMs;
         }
         tft.fillSmoothRoundRect(
-            tft.width() / 2 - rectWidth / 2 + 2,
-            140 + 2,
-            rectWidth * (currentSongPositionMs/currentSong.durationMs) - 4,
-            rectHeight - 4,
-            10,
-            TFT_GREEN
+                barX + 2,
+                barY + 2,
+                barWidth * (currentSongPositionMs/currentSong.durationMs) - 4,
+                barHeight - 4,
+                10,
+                TFT_GREEN
         );
         // Serial.println(currentSongPositionMs);
         // Serial.println(currentSong.durationMs);
@@ -642,6 +721,12 @@ public:
     float currentSongPositionMs;
     float lastSongPositionMs;
     int currVol;
+    // Current gradient background endpoints, sampled from the album art.
+    // Kept here (not local to drawScreen) so the like-icon/progress-bar clear
+    // fills on later partial-refresh calls can match the background that's
+    // already on screen instead of using a stale/guessed color.
+    uint16_t bgColorTop = TFT_BLACK;
+    uint16_t bgColorBottom = TFT_BLACK; 
 private:
     std::unique_ptr<WiFiClientSecure> client;
     HTTPClient https;
@@ -716,8 +801,22 @@ void setup(){
     tft.begin();
     tft.fillScreen(TFT_BLACK);
     tft.setRotation(1);
+    tft.invertDisplay(true); //some esp-32 ship with photonegative
     // The jpeg image can be scaled by a factor of 1, 2, 4, or 8
-    TJpgDec.setJpgScale(4);
+    TJpgDec.setJpgScale(2); //2 should be about 150x150
+    // Compute layout now that the panel's real width/height are known (after
+    // begin()+setRotation()). Album art sits top-left and large; artist/song
+    // text sits in a column to its right; the progress bar runs along the
+    // bottom of the screen.
+    albumSize = min(tft.width() - 20, 160);   // cap so it doesn't dominate tiny screens
+    albumX = 10;
+    albumY = 10;
+    textX = albumX + albumSize + 10;
+    textW = tft.width() - textX - 10;
+    barHeight = 10;
+    barWidth = tft.width() - 40;
+    barX = 20;
+    barY = tft.height() - barHeight - 20; // near the bottom, with a small margin 
 
     // The byte order can be swapped (set true for TFT_eSPI)
     TJpgDec.setSwapBytes(true);
