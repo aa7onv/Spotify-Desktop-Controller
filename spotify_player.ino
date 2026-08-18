@@ -42,7 +42,7 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap)
 }
 
 /*=========================
-user vars -change these
+|User modifiable variables|
 =========================*/
 // WiFi credentials
 #define WIFI_SSID ""
@@ -51,12 +51,13 @@ user vars -change these
 // Spotify API credentials
 #define CLIENT_ID ""
 #define CLIENT_SECRET ""
-#define REDIRECT_URI ""
+#define REDIRECT_URI "https://spotifyesp32.vercel.app/api/spotify/callback"
 
-// ESP32-CYD pin asggnm -----------------------------------------------
+// ESP32-CYD pin assignments -----------------------------------------------
 // Most GPIOs on a CYD board are already used by the display, touch controller,
-// SD card slot, and onboard speaker/LDR. 
-// 22 and 27 are free GPIOs.
+// SD card slot, and onboard speaker/LDR. These are commonly-free pins on the
+// spare header, but check your specific board's pinout/schematic and adjust
+// as needed.
 //this project doesn't use the SD card, so its SPI pins are free — GPIO 5 (CS), 18 (CLK), 19 (MISO), 23 (MOSI). That gives you enough spare pins without touching UART.
 #define BTN_PLAY_PAUSE 22 //GPIO
 #define BTN_LIKE       23 // SD card sniffer
@@ -66,7 +67,7 @@ user vars -change these
 // ---------------------------------------------------------------------------
 
 /*=========================
- HTTPClient vars / helper
+|Non - modifiable variables|
 ==========================*/
 
 String getValue(HTTPClient &http, String key) {
@@ -299,6 +300,7 @@ public:
             }
             // Serial.println(imageLink);
             
+            
             String albumName = getValue(https,"name");
             String artistName = getValue(https,"name");
             String songDuration = getValue(https,"duration_ms");
@@ -367,6 +369,7 @@ public:
             Serial.println(response);
             https.end();
         }
+
         
         // Disconnect from the Spotify API
         
@@ -401,6 +404,7 @@ public:
             Serial.println(response);
             https.end();
         }
+
         
         // Disconnect from the Spotify API
         
@@ -492,6 +496,7 @@ public:
             Serial.println(response);
         }
 
+        
         // Disconnect from the Spotify API
         https.end();
         getTrackInfo();
@@ -546,6 +551,7 @@ public:
             String response = https.getString();
             Serial.println(response);
         }
+
         
         // Disconnect from the Spotify API
         https.end();
@@ -571,6 +577,7 @@ public:
             Serial.println(response);
         }
 
+        
         // Disconnect from the Spotify API
         https.end();
         getTrackInfo();
@@ -597,6 +604,7 @@ public:
             Serial.println(response);
         }
 
+        
         // Disconnect from the Spotify API
         https.end();
         return success;
@@ -651,26 +659,27 @@ int buttonPins[] = {BTN_PLAY_PAUSE, BTN_LIKE, BTN_SKIP_FWD, BTN_SKIP_BACK};
 //Funcs for all api calls
 
 //Create screen control class
+//Show a face
 //Show currently playing
 //Show volume change
 
 //Object instances
-WebServer server(80); // port 80
+WebServer server(80); //Server on port 80
 SpotConn spotifyConnection;
 
 //Web server callbacks
 void handleRoot() {
     Serial.println("handling root");
-    char page[500];
-    sprintf(page,mainPage,CLIENT_ID,REDIRECT_URI);
+    char page[900];
+    snprintf(page,sizeof(page),mainPage, CLIENT_ID, REDIRECT_URI);
     server.send(200, "text/html", String(page)+"\r\n"); //Send web page
 }
 
 void handleCallbackPage() {
     if(!spotifyConnection.accessTokenSet){
-        if (server.arg("code") == ""){     // if param not found
-            char page[500];
-            sprintf(page,errorPage,CLIENT_ID,REDIRECT_URI);
+        if (server.arg("code") == ""){     //Parameter not found
+            char page[900];
+            snprintf(page,sizeof(page), errorPage,CLIENT_ID,REDIRECT_URI);
             server.send(200, "text/html", String(page)); //Send web page
         }else{     //Parameter found
             if(spotifyConnection.getUserCode(server.arg("code"))){
@@ -688,17 +697,18 @@ void handleCallbackPage() {
 long timeLoop;
 long refreshLoop;
 bool serverOn = true;
-
 /*==============
-initialize
+|Setup function|
 ==============*/
 void setup(){
     Serial.begin(115200);
     // delay(1000);
     // Initialise SPIFFS
-    if (!SPIFFS.begin()) {
-        Serial.println("SPIFFS initialisation failed!");
-        while (1) yield();
+    // 'true' tells SPIFFS to auto-format if mounting fails - this is expected on
+    // a freshly flashed board where SPIFFS has never been initialized before.
+    if (!SPIFFS.begin(true)) {
+        Serial.println("SPIFFS initialisation failed!!");
+        while (1) yield(); 
     }
     Serial.println("\r\nInitialisation done.");
 
@@ -706,11 +716,13 @@ void setup(){
     tft.begin();
     tft.fillScreen(TFT_BLACK);
     tft.setRotation(1);
-   
-    TJpgDec.setJpgScale(4);  // jpeg image can be scaled by  1, 2, 4, 8
-    TJpgDec.setSwapBytes(true); 
+    // The jpeg image can be scaled by a factor of 1, 2, 4, or 8
+    TJpgDec.setJpgScale(4);
 
+    // The byte order can be swapped (set true for TFT_eSPI)
+    TJpgDec.setSwapBytes(true);
 
+    // The decoder must be given the exact name of the rendering function above
     TJpgDec.setCallback(tft_output);
 
     WiFi.begin(WIFI_SSID, PASSWORD);
@@ -734,12 +746,12 @@ void setup(){
 
     tft.println(WiFi.localIP());
 }
-// init WiFi 
-// -> shows Ip on screen
-// -> spotify API handshake (SpotConn func)
-// -> init  screen
-// -> check curr playing currently playing (SpotCon func)
-// -> draw screen if needed
+// * Sets up WiFi
+// * Shows Ip on screen
+// * Goes through spotify API handshake (SpotConn func)
+// * Initializes screen
+// * Checks to see if anything is currently playing (SpotCon func)
+// * Shows cute face if needed
 
 void loop(){
     if(spotifyConnection.accessTokenSet){
@@ -789,7 +801,7 @@ void loop(){
             }
         }
         
-        // ESP32 ADC is 12-bit (0-4095) 
+        // ESP32 ADC is 12-bit (0-4095) vs ESP8266's 10-bit (0-1023)
         int volRequest = map(analogRead(VOL_POT_PIN),0,4095,0,100);
         if(abs(volRequest - spotifyConnection.currVol) > 2){
             spotifyConnection.adjustVolume(volRequest);
