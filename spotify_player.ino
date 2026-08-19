@@ -1,3 +1,9 @@
+/*adjustable vars for func / performance
+setJpgScale()
+COLOR_SAMPLE_MAX
+SPI_Frequency in User_Setup.h
+
+*/
 #include <TJpg_Decoder.h> // jpeg decoder library
 #include <FS.h>
 #include <SPIFFS.h>        // file system for ESP32 flash memory
@@ -64,23 +70,80 @@ void drawGradientBackground(uint16_t colorTop, uint16_t colorBottom){
     }
 } 
 
-// Accumulates pixel color sums instead of drawing to screen - used as a
-// TJpg_Decoder callback to compute the album art's average color, so we can
-// derive the gradient background from it without a full histogram/clustering
-// pass (too heavy for this MCU). Doesn't touch the display.
-
-uint32_t colorSumR = 0, colorSumG = 0, colorSumB = 0, colorSampleCount = 0;
+//samples a fixed number of pixels via reservoir sampling 
+// then runs a small 2-means clustering pass on them to find two 
+// actually distinct dominant colors for the gradient.
+#define COLOR_SAMPLE_MAX 64 
+#define COLOR_SAMPLE_MAX 64
+uint8_t sampleR[COLOR_SAMPLE_MAX], sampleG[COLOR_SAMPLE_MAX], sampleB[COLOR_SAMPLE_MAX];
+uint32_t colorSampleCount = 0; // total pixels seen (for reservoir sampling), not the array length
 bool color_sample_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap)		
 {
     uint32_t n = (uint32_t)w * h;
     for (uint32_t i = 0; i < n; i++) {
         uint16_t p = bitmap[i];
-        colorSumR += (p >> 11) & 0x1F; // 5-bit red
-        colorSumG += (p >> 5) & 0x3F;  // 6-bit green
-        colorSumB += p & 0x1F;         // 5-bit blue
+        uint8_t r8 = ((p >> 11) & 0x1F) << 3; // 5-bit -> 8-bit
+        uint8_t g8 = ((p >> 5) & 0x3F) << 2;  // 6-bit -> 8-bit
+        uint8_t b8 = (p & 0x1F) << 3;         // 5-bit -> 8-bit
+        if (colorSampleCount < COLOR_SAMPLE_MAX) {
+            sampleR[colorSampleCount] = r8;
+            sampleG[colorSampleCount] = g8;
+            sampleB[colorSampleCount] = b8;
+        } else {
+            uint32_t j = random(0, colorSampleCount + 1);
+            if (j < COLOR_SAMPLE_MAX) {
+                sampleR[j] = r8; sampleG[j] = g8; sampleB[j] = b8;
+            }
+        }
         colorSampleCount++;
     }
     return 1; // keep decoding, we just don't draw these blocks
+}
+
+// Runs a few iterations of 2-means on the sampled pixels and packs the two
+// resulting cluster centers into RGB565, lighter one first. sampleCount is
+// how many of the COLOR_SAMPLE_MAX slots are actually filled (min of
+// colorSampleCount and COLOR_SAMPLE_MAX).
+void computeTwoDominantColors(int sampleCount, uint16_t &lighter, uint16_t &darker) {
+    int idxMin = 0, idxMax = 0, minLum = 9999, maxLum = -1;
+    for (int i = 0; i < sampleCount; i++) {
+        int lum = sampleR[i] + sampleG[i] + sampleB[i];
+        if (lum < minLum) { minLum = lum; idxMin = i; }
+        if (lum > maxLum) { maxLum = lum; idxMax = i; }
+    }
+    float c0r = sampleR[idxMin], c0g = sampleG[idxMin], c0b = sampleB[idxMin];
+    float c1r = sampleR[idxMax], c1g = sampleG[idxMax], c1b = sampleB[idxMax];
+
+    for (int iter = 0; iter < 4; iter++) {
+        float sum0r=0, sum0g=0, sum0b=0; int count0=0;
+        float sum1r=0, sum1g=0, sum1b=0; int count1=0;
+        for (int i = 0; i < sampleCount; i++) {
+            float dr0 = sampleR[i]-c0r, dg0 = sampleG[i]-c0g, db0 = sampleB[i]-c0b;
+            float dr1 = sampleR[i]-c1r, dg1 = sampleG[i]-c1g, db1 = sampleB[i]-c1b;
+            if ((dr0*dr0+dg0*dg0+db0*db0) <= (dr1*dr1+dg1*dg1+db1*db1)) {
+                sum0r+=sampleR[i]; sum0g+=sampleG[i]; sum0b+=sampleB[i]; count0++;
+            } else {
+                sum1r+=sampleR[i]; sum1g+=sampleG[i]; sum1b+=sampleB[i]; count1++;
+            }
+        }
+        if (count0 > 0) { c0r=sum0r/count0; c0g=sum0g/count0; c0b=sum0b/count0; }
+        if (count1 > 0) { c1r=sum1r/count1; c1g=sum1g/count1; c1b=sum1b/count1; }
+    }
+
+    // A few very monochrome covers can converge both clusters to nearly the
+    // same color, which would make the gradient invisible. If they're too
+    // close, nudge them apart so there's still a visible top-to-bottom shift.
+    float lumDiff = (c1r+c1g+c1b) - (c0r+c0g+c0b);
+    if (abs(lumDiff) < 40) {
+        c0r = min(255.0f, c0r+25); c0g = min(255.0f, c0g+25); c0b = min(255.0f, c0b+25);
+        c1r = max(0.0f, c1r-25);   c1g = max(0.0f, c1g-25);   c1b = max(0.0f, c1b-25);
+    }
+
+    uint16_t colorA = (((uint8_t)c0r & 0xF8) << 8) | (((uint8_t)c0g & 0xFC) << 3) | ((uint8_t)c0b >> 3);
+    uint16_t colorB = (((uint8_t)c1r & 0xF8) << 8) | (((uint8_t)c1g & 0xFC) << 3) | ((uint8_t)c1b >> 3);
+    bool aIsLighter = (c0r+c0g+c0b) >= (c1r+c1g+c1b);
+    lighter = aIsLighter ? colorA : colorB;
+    darker  = aIsLighter ? colorB : colorA;
 }
 
 
@@ -261,17 +324,7 @@ public:
         client = std::make_unique<WiFiClientSecure>();
         client->setInsecure();
     }
-    // httpResponse makeSpotifyRequest(const char* URI, const char** headers, int numHeaders, const char* RequestBody){
-    //     https.begin(*client,URI);
-    //     for(;numHeaders>0;numHeaders--,headers += 2){
-    //         https.addHeader(*headers,*(headers+1));
-    //     }
-    //     struct httpResponse res;
-    //     res.responseCode = https.POST(RequestBody);
-    //     res.responseMessage = https.getString()
-    //     https.end();
-    //     return res;
-    // }
+
 	bool getUserCode(String serverCode) {
         https.begin(*client,"https://accounts.spotify.com/api/token");
         String auth = "Basic " + base64::encode(String(CLIENT_ID) + ":" + String(CLIENT_SECRET));
@@ -469,38 +522,32 @@ public:
         
         return success;
     }
-    bool drawScreen(bool fullRefresh = false, bool likeRefresh = false){
+
+    bool drawScreen(bool fullRefresh = false, bool likeRefresh = false, bool playRefresh = false){
        // int rectWidth = 120;
         //int rectHeight = 10;
         if(fullRefresh){
-            // Sample the album art's average color (or fall back to a neutral
-            // dark tone if there's no art yet) and paintthe bg with
-            // a two-color gradient derived from it, before drawing anything
-            // else on top. 
-            uint16_t avgR = 20, avgG = 20, avgB = 20; // fallback: neutral dark gray
+            // Sample the album art and derive the gradient from its two most
+            // dominant colors (computeTwoDominantColors) rather than a
+            // flat average, Falls back to a
+            // neutral dark tone if there's no art yet.
+            bgColorTop = 0x2104;    // neutral dark gray fallback (no art yet)
+            bgColorBottom = 0x0000; // black
             if (SPIFFS.exists("/albumArt.jpg") == true) {
-                colorSumR = colorSumG = colorSumB = 0;
                 colorSampleCount = 0;
                 TJpgDec.setSwapBytes(true);
-                TJpgDec.setJpgScale(4); // was 8 - less aggressive downscale, more reliable decode
+                TJpgDec.setJpgScale(4);
                 TJpgDec.setCallback(color_sample_output);
                 TJpgDec.drawFsJpg(0, 0, "/albumArt.jpg");
                 TJpgDec.setCallback(tft_output); // restore normal drawing callback
-                Serial.printf("[gradient] sampled %u pixels from albumArt.jpg\n", (unsigned)colorSampleCount);
-                if (colorSampleCount > 0) {
-                    avgR = (colorSumR / colorSampleCount) << 3; // 5-bit -> 8-bit
-                    avgG = (colorSumG / colorSampleCount) << 2; // 6-bit -> 8-bit
-                    avgB = (colorSumB / colorSampleCount) << 3; // 5-bit -> 8-bit
+                int usedSamples = min((uint32_t)COLOR_SAMPLE_MAX, colorSampleCount);
+                Serial.printf("[gradient] sampled %u pixels (of %u seen) from albumArt.jpg\n", usedSamples, (unsigned)colorSampleCount);
+                if (usedSamples > 0) {
+                    computeTwoDominantColors(usedSamples, bgColorTop, bgColorBottom);
                 } else {
                     Serial.println("[gradient] WARNING: 0 pixels sampled - decode likely failed, using fallback gray");
                 }
-                Serial.printf("[gradient] avg RGB = %u,%u,%u\n", avgR, avgG, avgB);
             }
-            auto clampByte = [](int v){ return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)); };
-            uint8_t topR = clampByte(avgR + 50), topG = clampByte(avgG + 50), topB = clampByte(avgB + 50);
-            uint8_t botR = clampByte(avgR - 50), botG = clampByte(avgG - 50), botB = clampByte(avgB - 50);
-            bgColorTop    = ((topR & 0xF8) << 8) | ((topG & 0xFC) << 3) | (topB >> 3);
-            bgColorBottom = ((botR & 0xF8) << 8) | ((botG & 0xFC) << 3) | (botB >> 3);
             drawGradientBackground(bgColorTop, bgColorBottom); 
 
             if (SPIFFS.exists("/albumArt.jpg") == true) { 
@@ -516,7 +563,7 @@ public:
             tft.setTextWrap(true);
             tft.setTextColor(TFT_WHITE);
 
-            tft.setTextSize(1); 
+            tft.setTextSize(1);
             tft.setCursor(textX,albumY + 15);
             printSplitString(currentSong.artist,14,albumY + 15,textX,textW);
 
@@ -540,16 +587,25 @@ public:
                 TFT_DARKGREEN);
         }
         if(fullRefresh || likeRefresh){
+            // draw heart from primitives
+            int hx = tft.width()-21, hy = 0;
+            tft.fillRect(hx, hy, 21, 21, bgColorTop); // clear the icon's box first
             if(currentSong.isLiked){
-                TJpgDec.setSwapBytes(true);
-                TJpgDec.setJpgScale(1);
-                TJpgDec.drawFsJpg(tft.width()-21, 0, "/heart.jpg");
-            //    tft.fillCircle(128-10,10,10,TFT_GREEN);
+                tft.fillCircle(hx+6, hy+7, 5, TFT_RED);
+                tft.fillCircle(hx+15, hy+7, 5, TFT_RED);
+                tft.fillTriangle(hx+1, hy+8, hx+20, hy+8, hx+10, hy+20, TFT_RED);
+            }
+            // else: left cleared/blank
+        }
+        if(fullRefresh || playRefresh){
+            // Play/pause drawn the same way, sitting just to the heart's left.
+            int px = tft.width()-44, py = 0;
+            tft.fillRect(px, py, 21, 21, bgColorTop); // clear the icon's box first
+            if(isPlaying){
+                tft.fillRect(px+5, py+3, 4, 15, TFT_WHITE);
+                tft.fillRect(px+12, py+3, 4, 15, TFT_WHITE);
             }else{
-                // Clear with the background's top gradient color instead of a
-                // flat black square, so it blends in now that the background
-                // isn't solid black anymore. 
-                tft.fillRect(tft.width()-21,0,21,21,bgColorTop);
+                tft.fillTriangle(px+6, py+3, px+6, py+18, px+18, py+10, TFT_WHITE);
             }
         }
         if(lastSongPositionMs > currentSongPositionMs){
@@ -579,6 +635,7 @@ public:
     bool togglePlay(){
         String url = "https://api.spotify.com/v1/me/player/" + String(isPlaying ? "pause" : "play");
         isPlaying = !isPlaying;
+        drawScreen(false, false, true); // redraw just the play/pause icon immediately 
         https.begin(*client,url);
         String auth = "Bearer " + String(accessToken);
         https.addHeader("Authorization",auth);
@@ -808,10 +865,9 @@ bool serverOn = true;
 ==============*/
 void setup(){
     Serial.begin(115200);
-    // delay(1000);
-    // Initialise SPIFFS
-    // 'true' tells SPIFFS to auto-format if mounting fails - this is expected on
-    // a freshly flashed board where SPIFFS has never been initialized before.
+    // Seeds the reservoir sampling used by the gradient-color extraction 
+    // (random() with no seed can repeat the same sequence across boots). 
+    randomSeed(esp_random());
     if (!SPIFFS.begin(true)) {
         Serial.println("SPIFFS initialisation failed!!");
         while (1) yield(); 
