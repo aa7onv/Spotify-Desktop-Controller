@@ -182,6 +182,17 @@ struct songDetails{
 
 char *parts[10];
 
+// formats milliseconds as M:SS (e.g. 3:07) for the track-length label above
+// the progress bar.
+String formatDuration(int ms) {
+    int totalSeconds = ms / 1000;
+    int minutes = totalSeconds / 60;
+    int seconds = totalSeconds % 60;
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d:%02d", minutes, seconds);
+    return String(buf);
+} 
+
 void printSplitString(String text,int maxLineSize, int yPos, int columnX, int columnWidth)
 {
     int currentWordStart = 0;
@@ -236,9 +247,7 @@ void printSplitString(String text,int maxLineSize, int yPos, int columnX, int co
         // Center each wrapped line within its column (columnX..columnX+columnWidth)
         // instead of the whole screen, so text sits in the right-hand column
         // next to the album art rather than spanning edge-to-edge.
-        tft.setCursor((int)(tft.width()/2 - tft.textWidth(output) / 2),tft.getCursorY());
         tft.setCursor((int)(columnX + columnWidth/2 - tft.textWidth(output) / 2),tft.getCursorY());
-        tft.println(output);
         tft.println(output);
         // free(printable);
     }
@@ -363,7 +372,9 @@ public:
             // Serial.println(songId);
             https.end();
             // listSPIFFS();
+            Serial.printf("[track] songId=%s currentSong.Id=%s\n", songId.c_str(), currentSong.Id.c_str());
             if (songId != currentSong.Id){
+                Serial.println("[track] new song detected, will refresh art + gradient");
                 
                 if(SPIFFS.exists("/albumArt.jpg") == true) {
                     SPIFFS.remove("/albumArt.jpg");
@@ -471,19 +482,23 @@ public:
                 colorSumR = colorSumG = colorSumB = 0;
                 colorSampleCount = 0;
                 TJpgDec.setSwapBytes(true);
-                TJpgDec.setJpgScale(8); // small/fast decode, we only need an average
+                TJpgDec.setJpgScale(4); // was 8 - less aggressive downscale, more reliable decode
                 TJpgDec.setCallback(color_sample_output);
                 TJpgDec.drawFsJpg(0, 0, "/albumArt.jpg");
                 TJpgDec.setCallback(tft_output); // restore normal drawing callback
+                Serial.printf("[gradient] sampled %u pixels from albumArt.jpg\n", (unsigned)colorSampleCount);
                 if (colorSampleCount > 0) {
                     avgR = (colorSumR / colorSampleCount) << 3; // 5-bit -> 8-bit
                     avgG = (colorSumG / colorSampleCount) << 2; // 6-bit -> 8-bit
                     avgB = (colorSumB / colorSampleCount) << 3; // 5-bit -> 8-bit
+                } else {
+                    Serial.println("[gradient] WARNING: 0 pixels sampled - decode likely failed, using fallback gray");
                 }
+                Serial.printf("[gradient] avg RGB = %u,%u,%u\n", avgR, avgG, avgB);
             }
             auto clampByte = [](int v){ return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)); };
-            uint8_t topR = clampByte(avgR + 35), topG = clampByte(avgG + 35), topB = clampByte(avgB + 35);
-            uint8_t botR = clampByte(avgR - 35), botG = clampByte(avgG - 35), botB = clampByte(avgB - 35);
+            uint8_t topR = clampByte(avgR + 50), topG = clampByte(avgG + 50), topB = clampByte(avgB + 50);
+            uint8_t botR = clampByte(avgR - 50), botG = clampByte(avgG - 50), botB = clampByte(avgB - 50);
             bgColorTop    = ((topR & 0xF8) << 8) | ((topG & 0xFC) << 3) | (topB >> 3);
             bgColorBottom = ((botR & 0xF8) << 8) | ((botG & 0xFC) << 3) | (botB >> 3);
             drawGradientBackground(bgColorTop, bgColorBottom); 
@@ -500,15 +515,21 @@ public:
             tft.setTextDatum(MC_DATUM);
             tft.setTextWrap(true);
             tft.setTextColor(TFT_WHITE);
+
+            tft.setTextSize(1); 
             tft.setCursor(textX,albumY + 15);
             printSplitString(currentSong.artist,14,albumY + 15,textX,textW);
 
-            
-            tft.setCursor(textX,albumY + 55);
-            printSplitString(currentSong.song,14,albumY + 55,textX,textW); 
-            // tft.print(currentSong.song);
-            // tft.drawString(currentSong.song, tft.width() / 2, 115);
-            // tft.drawString(currentSong.song, tft.width() / 2, 125);
+            tft.setTextSize(2);
+            tft.setCursor(textX,albumY + 70);
+            printSplitString(currentSong.song,7,albumY + 70,textX,textW); 
+            tft.setTextSize(1); // reset
+
+            // Track length, shown just above the progress bar.
+            String durationText = formatDuration(currentSong.durationMs);
+            int durationTextX = barX + barWidth/2 - tft.textWidth(durationText)/2;
+            tft.setCursor(durationTextX, barY - 14);
+            tft.println(durationText);
             
             tft.drawRoundRect(
                 barX,
@@ -801,8 +822,8 @@ void setup(){
     tft.begin();
     tft.fillScreen(TFT_BLACK);
     tft.setRotation(1);
-    tft.invertDisplay(true); //some esp-32 ship with photonegative
-    // The jpeg image can be scaled by a factor of 1, 2, 4, or 8
+    tft.invertDisplay(true); //some esp-32 ship with photo-negative
+    // The jpeg image can be scaled DOWN by a factor of 1, 2, 4, or 8
     TJpgDec.setJpgScale(2); //2 should be about 150x150
     // Compute layout now that the panel's real width/height are known (after
     // begin()+setRotation()). Album art sits top-left and large; artist/song
