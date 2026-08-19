@@ -1,0 +1,6 @@
+arduino ide -> boards manager -> esp32 by espressif systems -> esp32 dev module -> open  serial monitor
+boot mode - press boot + rst simultaneously when Connecting........_____..... appears
+
+got to http://###.##.#.#/ -> hit login -> copy ?code=
+
+go to http://###.##.#.#/callback?code=example&state=esp32cyd
